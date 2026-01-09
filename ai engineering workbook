@@ -1,0 +1,875 @@
+# AI Project Workbook (RAG, Extraction, Agents, MCP, Fine-tuning)
+
+Save this file. Open it at the start of every new project.
+
+---
+
+## PART 1: What kind of project is this?
+
+Ask these questions in order. Stop at the first "yes".
+
+| # | Question | If YES, use this pattern |
+|---|----------|--------------------------|
+| 1 | Can the whole document fit inside one prompt? (a few pages) | **No RAG.** Paste the text into the prompt. Done. |
+| 2 | Do I need specific fields out of a document (name, date, amount)? | **Extraction** (Pattern 2 below). Also no RAG. |
+| 3 | Are the answers inside a big pile of documents that will not fit in one prompt? | **RAG** (Pattern 1 below) |
+| 4 | Must the AI choose between several actions (search, calculate, call an API)? | **Agent + tools** (Pattern 3 below) |
+| 5 | Do I want many different AI apps to use my tools in a standard way? | **MCP** (Part 4) |
+| 6 | Do I need the model to change its style or behaviour, not just know more facts? | **Fine-tuning** (Part 5) |
+
+Simple rule:
+- Need the model to KNOW more facts? Use RAG.
+- Need the model to BEHAVE differently? Use fine-tuning.
+- Need the model to DO things? Use an agent with tools.
+
+---
+
+## PART 2: When to do each step (RAG)
+
+The order never changes.
+
+| Step | What | When you do it | Why this order |
+|------|------|----------------|----------------|
+| 1 | **Chunk** | When new documents arrive | You cannot embed one giant blob. Small focused pieces search better. |
+| 2 | **Embed** | Right after chunking. Once per chunk. | Turns text into numbers so you can search by meaning. |
+| 3 | **Store** | Right after embedding | Saves vectors on disk so you do not redo work after a restart. |
+| 4 | **Retrieve** | Every time a question arrives | Finds the few chunks closest in meaning to the question. |
+| 5 | **Generate** | After retrieving | The LLM writes a clean answer using only those chunks. |
+| 6 | **Evaluate** | After steps 1 to 5 work | You cannot test a pipeline that does not exist yet. |
+
+See Part 8 for a full card on each step (what it does, when to use it, snippet, what to edit, how to check it).
+
+Important details:
+- Steps 1 to 3 happen at **upload time**, once per document.
+- Steps 4 and 5 happen at **question time**, every time.
+- The question is embedded automatically by Chroma inside step 4. You do not do it yourself.
+- Lower distance = closer match. If the best distance is high (for example above 0.8), the documents probably do not contain the answer.
+
+Chunking rule of thumb (this is the part you EDIT per project):
+- Clean text with blank lines between paragraphs: split on `\n\n`
+- Documentation pages: split on headings
+- PDFs from scanners or legal text: split on known headers, or by a fixed number of characters
+- Always print the chunks and look at them before moving on.
+
+---
+
+## PART 3: The starter template
+
+### Folder structure
+
+```
+my-project/
+  app/
+    __init__.py
+    main.py
+    evaluate.py
+  data/
+  static/
+    index.html
+  .env
+  .env.example
+  .gitignore
+  requirements.txt
+  Dockerfile
+```
+
+### .gitignore
+
+```
+.venv/
+__pycache__/
+.env
+chroma_db/
+data/
+*.log
+```
+
+### .env  (never commit this)
+
+```
+GROQ_API_KEY=your_key_here
+```
+
+### requirements.txt  (write by hand, keep it short)
+
+```
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+pypdf
+chromadb
+sentence-transformers
+groq
+requests
+```
+
+Add these only if you use agents:
+
+```
+langchain-core
+langchain-groq
+```
+
+Tip: do not use `pip freeze > requirements.txt` for Docker. It lists hundreds of packages, some Windows-only, and makes the build slow and fragile.
+
+### app/main.py  (Pattern 1: RAG)
+
+Parts marked REUSE you copy unchanged. Parts marked EDIT you change per project.
+
+```python
+import os
+import shutil
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from pypdf import PdfReader
+import chromadb
+from chromadb.utils import embedding_functions
+from groq import Groq
+
+load_dotenv()
+os.makedirs("data", exist_ok=True)
+
+app = FastAPI()
+
+# ---------- REUSE: settings, embedding, storage ----------
+MODEL = "openai/gpt-oss-120b"   # check the provider's current model list
+
+embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="all-MiniLM-L6-v2"
+)
+client = chromadb.PersistentClient(path="chroma_db")
+collection = client.get_or_create_collection(
+    name="docs", embedding_function=embedding_fn
+)
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
+# ---------- REUSE: data shape ----------
+class Question(BaseModel):
+    text: str
+
+
+# ---------- EDIT: how to get text and how to chunk ----------
+def read_pdf(path: str) -> str:
+    reader = PdfReader(path)
+    text = ""
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted + "\n"
+    return text
+
+
+def chunk_text(text: str) -> list[str]:
+    # EDIT THIS RULE for every new kind of document
+    parts = text.split("\n\n")
+    return [p.strip() for p in parts if len(p.strip()) > 50]
+
+
+# ---------- REUSE: upload = chunk + embed + store ----------
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    path = f"data/{file.filename}"
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    text = read_pdf(path)
+    chunks = chunk_text(text)
+    if not chunks:
+        return {"filename": file.filename, "chunks_added": 0}
+
+    collection.upsert(
+        documents=chunks,
+        ids=[f"{file.filename}_chunk_{i}" for i in range(len(chunks))],
+        metadatas=[{"source": file.filename} for _ in chunks],
+    )
+    return {"filename": file.filename, "chunks_added": len(chunks)}
+
+
+# ---------- REUSE: ask = retrieve + generate ----------
+@app.post("/ask")
+def ask(q: Question):
+    results = collection.query(query_texts=[q.text], n_results=3)
+    chunks = results["documents"][0]
+    if not chunks:
+        return {"question": q.text, "answer": "No documents uploaded yet."}
+
+    context = "\n\n".join(chunks)
+
+    # EDIT: wording of the prompt for your project
+    prompt = f"""Answer the question using ONLY the context below.
+If the answer is not in the context, say "I don't know."
+
+Context:
+{context}
+
+Question: {q.text}
+"""
+    resp = groq_client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return {
+        "question": q.text,
+        "answer": resp.choices[0].message.content,
+        "sources": results["metadatas"][0],
+        "distances": results["distances"][0],
+    }
+
+
+# ---------- REUSE: serve the UI ----------
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+    @app.get("/")
+    def home():
+        return FileResponse("static/index.html")
+```
+
+Run it: `uvicorn app.main:app --reload`, then open `/docs`.
+
+### Build order for a new project (write the FAKE version first)
+
+1. Make folders, venv, `.gitignore`, `.env`. Install requirements.
+2. Write only the server and a fake `/ask` that returns `{"answer": "test"}`. Run it. Prove the wiring works.
+3. Write `chunk_text` for your documents. Print the chunks. Look at them.
+4. Add `/upload` (chunk, embed, store). Upload one file. Check the count.
+5. Replace the fake `/ask` with real retrieval. Print the chunks it returns. Are they the right ones?
+6. Add generation.
+7. Write test questions (`evaluate.py`).
+8. UI, then Docker, then deploy.
+9. Commit after every step.
+
+If something breaks, you always know which step it is in.
+
+### Pattern 2: Extraction (no retrieval, no Chroma)
+
+Use when you want fields out of one document.
+
+```python
+import json
+
+@app.post("/extract")
+def extract(doc: Document):          # Document has a `text: str` field
+    prompt = f"""Extract these fields and return ONLY valid JSON:
+- invoice_number
+- date
+- bill_to
+- amount
+- due_date
+If a field is missing, use null.
+
+Document:
+{doc.text}
+"""
+    resp = groq_client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.choices[0].message.content
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "Model did not return valid JSON", "raw": raw}
+```
+
+What you EDIT: the field list. How you test it: documents with known correct fields, including messy ones and ones with missing fields.
+
+### Pattern 3: Agent with a tool (optional layer on top of RAG)
+
+Only add this after the plain RAG version works.
+
+```python
+from langchain_core.tools import tool
+from langchain_groq import ChatGroq
+
+@tool
+def search_docs(query: str) -> str:
+    """Search the uploaded documents. Use for questions about their content."""
+    r = collection.query(query_texts=[query], n_results=3)
+    return "\n\n".join(r["documents"][0])
+
+llm = ChatGroq(model=MODEL)
+llm_with_tools = llm.bind_tools([search_docs])
+
+# inside your /ask endpoint:
+response = llm_with_tools.invoke(q.text)
+if response.tool_calls:
+    call = response.tool_calls[0]
+    context = search_docs.invoke(call["args"])
+    # ...then build the grounded prompt and generate, as in Part 3
+else:
+    answer = response.content   # the model answered without searching
+```
+
+The tool's docstring is a prompt. The model reads it to decide when to use the tool. Write it clearly.
+
+### app/evaluate.py
+
+```python
+import requests
+
+test_cases = [
+    {"question": "EDIT: question 1", "expected": "EDIT: text the answer must contain"},
+    {"question": "EDIT: question 2", "expected": "EDIT"},
+]
+
+results = []
+for case in test_cases:
+    r = requests.post("http://127.0.0.1:8000/ask", json={"text": case["question"]})
+    answer = r.json()["answer"]
+    passed = case["expected"].lower() in answer.lower()
+    results.append(passed)
+    print(f"Q: {case['question']}\nA: {answer}\nPASSED: {passed}\n---")
+
+print(f"Passed {results.count(True)} of {len(test_cases)}")
+```
+
+Also add one question whose answer is NOT in your documents. The correct answer is "I don't know."
+
+Run with the server running in another terminal: `python -m app.evaluate`
+
+### Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Why the extra `torch` line: `sentence-transformers` needs PyTorch. On Linux, pip may download the huge GPU version by default. The CPU version is much smaller and faster to install.
+
+Heads-up for free hosting: free plans often have small memory (for example 512 MB). Loading an embedding model plus PyTorch may not fit. Check your host's limits before deploying. If it does not fit, use a hosted embedding API instead of a local model.
+
+---
+
+## PART 4: MCP (not covered by the template, but the template feeds it)
+
+**What MCP is:** a standard way to expose your tools so any compatible AI app can use them, without you writing custom connection code for each app.
+
+**How it relates to the template:** your `search_docs` function is already the hard part. MCP wraps it.
+
+Order of work:
+1. Have a working retrieval function (the template gives you this).
+2. Install the official MCP Python SDK (`pip install mcp`).
+3. Wrap the function as an MCP tool in a small separate file.
+4. Run it as an MCP server.
+5. Connect an MCP-compatible client to it and test.
+
+Rough shape (check the official docs for the current syntax before you build):
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("docs-search")
+
+@mcp.tool()
+def search_docs(query: str) -> str:
+    """Search the documentation for information about a topic."""
+    ...  # same retrieval code as the template
+
+if __name__ == "__main__":
+    mcp.run()
+```
+
+New things to learn: the MCP concepts (tools, resources, prompts), how a client connects to a server, and how to test a tool.
+
+---
+
+## PART 5: Fine-tuning (a different workflow, template does not apply)
+
+**Use it when:** the model must change how it writes or behaves (tone, strict output format, one narrow task done very reliably). Do NOT use it to add facts. Use RAG for facts.
+
+Order of work:
+1. Write down the exact behaviour you want to change. Try prompting first. If prompting is enough, stop.
+2. Build a dataset: many examples of input and ideal output. Quality matters more than quantity.
+3. Pick a small base model.
+4. Train with a light method (LoRA or QLoRA) using the Hugging Face libraries (`transformers`, `peft`, `trl`).
+5. Evaluate: run the same test questions on the base model and the tuned model. Compare.
+6. Serve the tuned model behind a FastAPI endpoint (the template's server part still helps here).
+
+Practical notes:
+- Training needs a GPU. Use a free cloud notebook such as Google Colab instead of your laptop. This also saves your data plan.
+- Models are large downloads (gigabytes). Plan your data before you start.
+- Your `evaluate.py` idea is reused in step 5.
+
+---
+
+## PART 6: What the template covers
+
+| Topic | Covered by the template? |
+|-------|--------------------------|
+| RAG | Yes, fully |
+| Document extraction | Yes (Pattern 2) |
+| Agents and tool use | Yes, basic (Pattern 3) |
+| Any LLM app backend (API + prompt + response) | Yes, this is the base |
+| Chat with memory of past messages | Small addition: send previous messages in the `messages` list |
+| MCP | No, but reuses your retrieval function |
+| Fine-tuning | No, separate workflow |
+
+---
+
+## PART 7: New project worksheet (fill this in before writing code)
+
+1. What does the user want to do, in one sentence?
+2. Which pattern from Part 1 fits? ________
+3. Where do the documents come from? (files, website, database)
+4. What does one good chunk look like? What is my chunking rule?
+5. What should the answer look like? (sentence, JSON, list with sources)
+6. Write 5 test questions with the expected answers. Include one that should get "I don't know."
+7. What can I fake first to prove the wiring?
+8. Where will it run? (my laptop, Docker, a free host) What are the memory limits?
+
+Commit message after each step, for example:
+- `Add project skeleton and fake /ask endpoint`
+- `Add chunking for <document type>`
+- `Add upload: chunk, embed, store in Chroma`
+- `Add retrieval and grounded generation`
+- `Add evaluation script with test cases`
+- `Add simple UI`
+- `Add Dockerfile`
+
+---
+
+## PART 8: Step cards (what each step is, when to use it, how to check it)
+
+Use these with the template in Part 3. Each card has: what it does, when to use it, the snippet, what you edit, a quick check, and the usual failure.
+
+### Card 1: CHUNK
+- **What it does:** cuts a long text into small pieces, each about one idea.
+- **Use it when:** you have documents that are too long to paste into one prompt and you want to search inside them.
+- **Skip it when:** the document is short, or you are extracting fields from one document (Formwise).
+- **Snippet:**
+```python
+def chunk_text(text: str) -> list[str]:
+    parts = text.split("\n\n")
+    return [p.strip() for p in parts if len(p.strip()) > 50]
+```
+- **You edit:** the split rule (`\n\n`, headings, fixed length) and the minimum length (50).
+- **Quick check:** `print(len(chunks))` then print 3 chunks. Does each one hold one idea?
+- **Usual failure:** you get 1 giant chunk, because the real text has no `\n\n`. Print `repr(text)` to see the real breaks, then change the split rule.
+
+### Card 2: EMBED
+- **What it does:** turns each chunk into a list of numbers that represents its meaning. Similar meanings get similar numbers.
+- **Use it when:** you want to search by meaning, not by exact words.
+- **Snippet:** you rarely write it. Chroma calls the embedding function for you.
+```python
+embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="all-MiniLM-L6-v2"
+)
+```
+- **You edit:** almost nothing. Only change the model if search quality is bad.
+- **Quick check:** none needed. Check retrieval (Card 4) instead.
+- **Usual failure:** the model download times out on a weak connection. Retry, and let it finish.
+- **Rule:** never mix two embedding models in one collection.
+
+### Card 3: STORE
+- **What it does:** saves the chunks and their numbers on disk so you do not redo the work after a restart.
+- **Use it when:** right after embedding, at upload time.
+- **Snippet:**
+```python
+collection.upsert(
+    documents=chunks,
+    ids=[f"{filename}_chunk_{i}" for i in range(len(chunks))],
+    metadatas=[{"source": filename} for _ in chunks],
+)
+```
+- **You edit:** the metadata (source, page, section, date). Add what you want to show or filter by later.
+- **Quick check:** `print(collection.count())`
+- **Usual failure:** "embedding function conflict" means the collection was created with a different embedding function. Delete the `chroma_db` folder and rebuild.
+
+### Card 4: RETRIEVE
+- **What it does:** finds the chunks closest in meaning to the question.
+- **Use it when:** every time a question arrives.
+- **Snippet:**
+```python
+results = collection.query(query_texts=[q.text], n_results=3)
+chunks = results["documents"][0]
+distances = results["distances"][0]
+```
+- **You edit:** `n_results` (how many chunks). Too few misses answers spread across chunks. Too many adds noise and cost. Start at 3.
+- **Quick check:** print the chunks for 5 real questions. Are they the right ones? Lower distance means closer.
+- **Usual failure:** the right chunk is not returned. Fix chunking first, then `n_results`, before touching the prompt.
+
+### Card 5: GENERATE
+- **What it does:** the LLM writes a clean answer using only the retrieved chunks.
+- **Use it when:** after retrieval, when the user wants an answer, not raw text.
+- **Snippet:**
+```python
+prompt = f"""Answer the question using ONLY the context below.
+If the answer is not in the context, say "I don't know."
+
+Context:
+{context}
+
+Question: {q.text}
+"""
+resp = groq_client.chat.completions.create(
+    model=MODEL, messages=[{"role": "user", "content": prompt}]
+)
+answer = resp.choices[0].message.content
+```
+- **You edit:** the wording of the prompt (tone, format, language, "cite the source").
+- **Quick check:** ask something that is NOT in the documents. It must say "I don't know."
+- **Usual failure:** right chunk retrieved but wrong answer means the problem is the prompt. Wrong chunk retrieved means the problem is retrieval.
+
+### Card 6: EXTRACT (a different pattern, no retrieval)
+- **What it does:** reads one document and returns specific fields as JSON.
+- **Use it when:** you want structured data, not an answer.
+- **Snippet:** see Pattern 2 in Part 3.
+- **You edit:** the field list, one per document type.
+- **Quick check:** test a clean document, a messy one, and one with missing fields. Missing fields must be `null`, never invented.
+- **Usual failure:** the model adds extra words around the JSON. Say "return ONLY JSON," parse with `try/except`, and validate with a schema.
+
+### Card 7: AGENT AND TOOLS
+- **What it does:** lets the LLM decide whether to use a tool (like search) or answer directly.
+- **Use it when:** some questions need searching and some don't, or you have several tools.
+- **Skip it when:** every question always needs the same steps. A plain pipeline is simpler and cheaper.
+- **Snippet:** see Pattern 3 in Part 3.
+- **You edit:** the tool's docstring. The model reads it to decide when to call the tool.
+- **Quick check:** one question that needs the tool, one that does not. Check which one used it.
+- **Usual failure:** the tool is never called, because the docstring is vague.
+
+### Card 8: EVALUATE
+- **What it does:** runs questions with known answers through your system and counts passes.
+- **Use it when:** after the pipeline works, and again after every change.
+- **Snippet:** see `evaluate.py` in Part 3.
+- **You edit:** the test questions and expected answers. Include one "not in the documents" question.
+- **Quick check:** the pass count. Write it in your README.
+- **Rule:** check retrieval and answer separately, so you know which layer to fix.
+
+### Glossary
+
+| Word | Meaning |
+|------|---------|
+| Chunk | A small piece of a document |
+| Embedding | The list of numbers that represents a piece of text's meaning |
+| Vector | Another word for that list of numbers |
+| Vector database | A database that stores vectors and searches by closeness (Chroma) |
+| Collection | A named group of chunks inside the database, like a table |
+| Metadata | Extra info stored with a chunk (source file, page) |
+| Distance | How far apart two meanings are. Lower is closer. |
+| n_results / top-k | How many chunks to retrieve |
+| Context | The retrieved text you put into the prompt |
+| Grounded | The answer is based only on the context, not guessed |
+| Hallucination | The model states something that is not true or not in the context |
+| Prompt | The instructions and text you send to the model |
+| Tool | A function the model is allowed to call |
+| Agent | A model that decides which tool to use, and when |
+| Upsert | Insert new records, or update them if the id already exists |
+| Schema | The exact shape of data you expect (Pydantic model) |
+| Evaluation set | Questions with known correct answers, used to test the system |
+
+### What you always need to judge yourself
+
+Reusing the code is fine. These four decisions are yours in every project:
+1. **The chunking rule.** Look at the real text and decide.
+2. **How many chunks to retrieve.** Test it on real questions.
+3. **The prompt wording.** Test it, especially the "I don't know" case.
+4. **The test questions.** Only you know what a correct answer looks like.
+
+If you can make those four decisions and use Cards 1 to 8 to find which step is broken, you can build any RAG project with the template.
+
+---
+
+## PART 0: Core Python toolkit (the pieces every project reuses)
+
+You don't need to memorize these. Read a card when you hit that pattern in code. Each card: what it is, when you reach for it, a minimal example, and the trap to avoid.
+
+### Variables and f-strings
+- **What:** a name that holds a value. An f-string drops a variable into text.
+- **Use when:** building any message, prompt, or printed line.
+```python
+name = "Kay"
+print(f"Hello {name}")        # Hello Kay
+```
+- **Trap:** `f"text"` needs the `f` right before the opening quote, no space.
+
+### Lists `[...]`
+- **What:** an ordered collection of items.
+- **Use when:** you have many of something (chunks, test cases, fields).
+```python
+fields = ["invoice_number", "date", "amount"]
+fields[0]        # "invoice_number" — counting starts at 0
+len(fields)      # 3
+fields.append("due_date")   # add one item to the end
+```
+
+### Dictionaries `{...}`
+- **What:** labeled values, accessed by name (key) instead of position.
+- **Use when:** one thing has several named properties (a test case, a config, a JSON object).
+```python
+case = {"question": "How many sick days?", "expected": "10"}
+case["question"]          # "How many sick days?"
+case.get("missing", "N/A")  # "N/A" — .get() returns a default instead of crashing if the key is absent
+```
+- **Trap:** `case["missing"]` (square brackets) crashes if the key does not exist. `case.get("missing")` does not. Use `.get()` when the key might be absent.
+
+### A dictionary OF lists (used in FIELD_SETS)
+```python
+FIELD_SETS = {
+    "invoice": ["invoice_number", "date", "amount"],
+    "resume": ["name", "email", "skills"],
+}
+FIELD_SETS["invoice"]            # the list for invoices
+FIELD_SETS.get("unknown", [])    # empty list if the type is not in the dict
+```
+- **Why this shape:** one place that maps "a category" to "a list of things for that category." Reused any time behavior depends on a type (document type, user role, language).
+
+### `for` loops
+- **What:** repeat an action once per item.
+- **Use when:** processing every chunk, every test case, every page.
+```python
+for case in test_cases:
+    print(case["question"])
+```
+- **Trap:** indentation defines what is inside the loop. A line at the wrong indent silently runs outside it.
+
+### List comprehensions `[... for ... in ... if ...]`
+- **What:** a compact way to build a new list from an old one, usually with a filter.
+- **Use when:** cleaning up chunks (removing empty or too-short ones).
+```python
+chunks = [c.strip() for c in parts if len(c.strip()) > 50]
+```
+Read it right to left: for each `c` in `parts`, keep it only if its stripped length is over 50, and store the stripped version.
+
+### String methods
+| Method | What it does | Example |
+|---|---|---|
+| `.split(sep)` | cuts a string into a list, at every `sep` | `"a,b,c".split(",")` → `["a","b","c"]` |
+| `.join(list)` | glues a list back into one string, called ON the separator | `"\n\n".join(chunks)` → chunks joined with blank lines between |
+| `.strip()` | removes leading/trailing whitespace | `"  hi  ".strip()` → `"hi"` |
+| `.lower()` | lowercases everything | `"Invoice".lower()` → `"invoice"` |
+| `in` | checks if something is inside a string or list | `"10" in answer` → True/False |
+| `.count(x)` | counts how many times `x` appears, called on a list or string | `[True, True, False].count(True)` → `2` |
+
+- **Trap:** `.join()` is called on the SEPARATOR, not the list: `"\n".join(my_list)`, never `my_list.join("\n")`.
+- **Trap:** `len()` and `sum()` are standalone functions, called by wrapping their target: `len(my_list)`, not `my_list.len()`.
+
+### Functions
+- **What:** a named, reusable block of logic. Same shape, always: inputs in, a result out.
+```python
+def extract_fields(text: str, fields: list[str]) -> dict:
+    ...
+    return result
+```
+- `text: str` and `fields: list[str]` are type hints — they document what is expected, and your editor can warn you if you pass the wrong type. Python does not strictly enforce them, but write them anyway; they are free documentation.
+- `-> dict` says what the function returns.
+
+### Classes / Pydantic models
+- **What:** a description of a shape of data. Not an action, a blueprint.
+```python
+class Document(BaseModel):
+    text: str
+```
+- **Use when:** defining what an endpoint expects to receive, or what a type of record looks like.
+
+### `try` / `except`
+- **What:** attempt something that might fail, and handle the failure instead of crashing.
+```python
+try:
+    extracted = json.loads(raw_output)
+except json.JSONDecodeError:
+    extracted = {"error": "bad JSON", "raw": raw_output}
+```
+- **Use when:** calling something external or unpredictable (parsing AI output, calling an API, reading a file that might not exist).
+- **Trap:** catch the SPECIFIC error you expect (`json.JSONDecodeError`), not a bare `except:`, so you don't accidentally hide a different, real bug.
+
+### Decorators (`@something`)
+- **What:** a label placed above a function that changes how it behaves or how it's used, without changing the function's own code.
+```python
+@app.post("/extract")
+def extract_data(doc: Document):
+    ...
+
+@tool
+def search_docs(query: str) -> str:
+    """Docstring the AI reads to decide when to call this."""
+    ...
+```
+- `@app.post("/path")` — connects a function to a URL and an HTTP method.
+- `@tool` — marks a function as something an AI agent is allowed to call.
+
+### `async def` and `await`
+- **What:** marks a function as one that can pause while waiting (for a file, a network call) without freezing the whole server.
+- **Use when:** file uploads, and generally anything involving `UploadFile`.
+```python
+@app.post("/extract-pdf")
+async def extract_from_pdf(file: UploadFile = File(...)):
+    ...
+```
+- **Rule of thumb:** copy `async def` for upload/file endpoints. You do not need to master asyncio to use this correctly here.
+
+### Imports
+- **What:** bringing in code someone else wrote (a library), or code you wrote in another file.
+```python
+from fastapi import FastAPI          # a thing from an installed package
+from app.chunker import load_and_chunk  # a thing from your own file
+import os                             # a whole built-in module, used as os.something
+```
+- **Trap:** `python file.py` vs `python -m package.file` behave differently for imports between your own files. If you get `ModuleNotFoundError` for your own code, try running it with `-m` and dots instead of slashes.
+
+### Environment variables and `.env`
+- **What:** a way to keep secrets (API keys) out of your code, so they're never committed to GitHub.
+```python
+from dotenv import load_dotenv
+import os
+load_dotenv()                         # reads .env into memory
+key = os.environ.get("GROQ_API_KEY")  # pulls one value out
+```
+
+
+---
+
+## PART 9: Worked example, fully explained — classify, then extract
+
+This is the Formwise upgrade, with every line explained. Use this as the model for how deeply to understand any new block before you move on.
+
+```python
+import os
+import shutil
+import json
+from fastapi import FastAPI, File, UploadFile
+from pydantic import BaseModel
+from groq import Groq
+from dotenv import load_dotenv
+from pypdf import PdfReader
+
+load_dotenv()
+os.makedirs("data", exist_ok=True)
+
+app = FastAPI()
+
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+MODEL = "openai/gpt-oss-120b"
+```
+Nothing new. Skeleton, server, settings. This block never really changes between projects (Part A in the alphabet model).
+
+```python
+class Document(BaseModel):
+    text: str
+```
+The shape of incoming data for the text-paste endpoint. One field, one type.
+
+```python
+FIELD_SETS = {
+    "invoice": ["invoice_number", "date", "bill_to", "amount", "due_date"],
+    "receipt": ["merchant", "date", "items", "total", "payment_method"],
+    "resume": ["name", "email", "phone", "skills", "most_recent_job"],
+    "contract": ["parties", "start_date", "end_date", "amount", "termination_terms"],
+    "other": ["summary"]
+}
+```
+A dictionary of lists. The key is a document type (a word), the value is the list of fields to pull out for that type. This is the ONLY place you edit to add a new document type. Add a key, add a list, done — nothing else in the file needs to change.
+
+```python
+def classify_document(text: str) -> str:
+    prompt = f"""What type of document is this? Answer with ONLY one word from this list:
+invoice, receipt, resume, contract, other
+
+Document:
+{text[:1000]}
+"""
+    response = groq_client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content.strip().lower()
+```
+- Takes the document text in, returns a single word out: one of your five categories.
+- `text[:1000]` — slicing. Takes only the first 1000 characters. Classifying doesn't need the whole document; the type is usually obvious from the top of the page. Sending less text is faster and cheaper.
+- `.strip().lower()` — cleans the model's answer so `"Invoice"`, `" invoice"`, `"invoice "` all become the same exact string: `"invoice"`. Without this, comparing strings later could silently fail just because of case or spacing.
+
+```python
+def extract_fields(text: str, fields: list[str]) -> dict:
+    field_list = "\n".join(f"- {f}" for f in fields)
+
+    prompt = f"""Extract the following fields from this document, and return ONLY valid JSON, nothing else:
+{field_list}
+
+If a field is missing, use null.
+
+Document:
+{text}
+"""
+    response = groq_client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw_output = response.choices[0].message.content
+
+    try:
+        return json.loads(raw_output)
+    except json.JSONDecodeError:
+        return {"error": "Model did not return valid JSON", "raw": raw_output}
+```
+- Takes the full document text AND a list of field names (this is what makes it reusable for any document type, instead of hardcoding one set of fields).
+- `field_list = "\n".join(f"- {f}" for f in fields)` — this line does two things at once:
+  1. `f"- {f}" for f in fields` is a list comprehension: for every field name in `fields`, make a string like `"- invoice_number"`.
+  2. `"\n".join(...)` glues all of those lines together with a line break between each, producing a bullet list as one string, ready to paste into the prompt.
+- The `try/except` is the safety net: AI output is text, not guaranteed JSON. If it fails to parse, you get a readable error instead of a crash.
+
+```python
+def read_pdf(file_path: str) -> str:
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted + "\n"
+    return text
+```
+- Opens a PDF, goes page by page, pulls out whatever text each page has.
+- `if extracted:` — some pages might return nothing (a blank page, a pure-image page); skip adding `None` to your text in that case.
+
+```python
+@app.post("/extract")
+def extract_data(doc: Document):
+    doc_type = classify_document(doc.text)
+    fields = FIELD_SETS.get(doc_type, FIELD_SETS["other"])
+    result = extract_fields(doc.text, fields)
+    result["document_type"] = doc_type
+    return result
+```
+This is where everything connects — read it as four sentences:
+1. Figure out what kind of document this is.
+2. Look up which fields matter for that type. `.get(doc_type, FIELD_SETS["other"])` means: use the type's list if it's a key we know; otherwise, fall back to the generic `"other"` list instead of crashing on an unexpected answer from the model.
+3. Extract exactly those fields.
+4. Add the detected type into the result, so the response tells you both WHAT it found and HOW it classified the document.
+
+```python
+@app.post("/extract-pdf")
+async def extract_from_pdf(file: UploadFile = File(...)):
+    file_path = f"data/{file.filename}"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    text = read_pdf(file_path)
+    doc_type = classify_document(text)
+    fields = FIELD_SETS.get(doc_type, FIELD_SETS["other"])
+    result = extract_fields(text, fields)
+    result["document_type"] = doc_type
+    return result
+```
+Same four-sentence logic as `/extract`, just starting from a saved PDF file instead of pasted text. `shutil.copyfileobj` copies the uploaded file's bytes onto your disk so `PdfReader` can open it.
+
+### How to extend this to a new project
+Say you want a "support ticket triage" project instead. You would:
+1. Keep everything in PART 0 and the skeleton unchanged.
+2. Change `FIELD_SETS` → maybe a `CATEGORIES` dict of category → required response fields.
+3. Change `classify_document`'s word list → your ticket categories (billing, bug, feature request...).
+4. Keep `extract_fields` exactly as is — it already takes any field list.
+5. Add a new "wow" piece on top — for example, auto-draft a reply per category.
+
+That is the whole method: keep the skeleton, swap the dictionary and the classification labels, reuse the extraction function untouched.

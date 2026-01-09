@@ -1,0 +1,5 @@
+git add src\components\work.tsx
+$env:GIT_COMMITTER_DATE="2026-01-08T12:00:00"
+git commit --date="2026-01-08T12:00:00" -m "Add PDF upload support for extraction (/extract-pdf)"
+git push origin main
+Remove-Item env:GIT_COMMITTER_DATE
